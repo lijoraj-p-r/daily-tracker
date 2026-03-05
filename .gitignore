@@ -1,2 +1,4 @@
 target/
 *.xlsx
+*.ics
+dependency-reduced-pom.xml
