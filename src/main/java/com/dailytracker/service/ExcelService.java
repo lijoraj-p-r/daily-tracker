@@ -2,7 +2,8 @@ package com.dailytracker.service;
 
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.ss.util.CellRangeAddress;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.apache.poi.xddf.usermodel.chart.*;
+import org.apache.poi.xssf.usermodel.*;
 
 import java.io.*;
 import java.nio.file.Path;
@@ -17,7 +18,6 @@ public class ExcelService {
     private static final String[] HEADERS = {"START TIME", "CATEGORY", "ACTIVITY DESCRIPTION", "END TIME", "DURATION (MIN)"};
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
-    
     private static final int HEADER_ROW_INDEX = 3;
 
     private Path getFilePath() {
@@ -29,11 +29,10 @@ public class ExcelService {
         Path path = getFilePath();
         File file = path.toFile();
 
-        try (Workbook workbook = getWorkbook(file)) {
-            Sheet sheet = getOrCreateSheet(workbook);
-            
-            // Close previous activity if exists
+        try (XSSFWorkbook workbook = (XSSFWorkbook) getWorkbook(file)) {
+            XSSFSheet sheet = (XSSFSheet) getOrCreateSheet(workbook);
             int lastRowNum = sheet.getLastRowNum();
+            
             if (lastRowNum > HEADER_ROW_INDEX) { 
                 Row lastRow = sheet.getRow(lastRowNum);
                 if (lastRow != null) {
@@ -44,50 +43,43 @@ public class ExcelService {
                 }
             }
 
-            // Create new activity row
             int nextRow = Math.max(sheet.getLastRowNum() + 1, HEADER_ROW_INDEX + 1);
             Row row = sheet.createRow(nextRow);
-            
             CellStyle dataStyle = createDataStyle(workbook, nextRow % 2 == 0);
             
             createStyledCell(row, 0, LocalDateTime.now().format(TIME_FMT), dataStyle);
             createStyledCell(row, 1, category.toUpperCase(), dataStyle);
             createStyledCell(row, 2, description, dataStyle);
-            createStyledCell(row, 3, "", dataStyle); // Placeholder for end time
-            createStyledCell(row, 4, "", dataStyle); // Placeholder for duration
+            createStyledCell(row, 3, "", dataStyle); 
+            createStyledCell(row, 4, "", dataStyle); 
 
-            // Auto-size columns
             for(int i=0; i < HEADERS.length; i++) sheet.autoSizeColumn(i);
 
+            updateCharts(workbook, sheet);
             saveWorkbook(workbook, file);
             System.out.println("Started: [" + category.toUpperCase() + "] " + description);
 
         } catch (IOException e) {
-            System.err.println("Error accessing file: " + e.getMessage());
+            System.err.println("Error: " + e.getMessage());
         }
     }
 
     public void stopCurrentActivity() {
         Path path = getFilePath();
         File file = path.toFile();
+        if (!file.exists()) return;
 
-        if (!file.exists()) {
-            System.out.println("No active session found for today.");
-            return;
-        }
-
-        try (Workbook workbook = new XSSFWorkbook(new FileInputStream(file))) {
-            Sheet sheet = workbook.getSheetAt(0);
+        try (XSSFWorkbook workbook = new XSSFWorkbook(new FileInputStream(file))) {
+            XSSFSheet sheet = workbook.getSheetAt(0);
             int lastRowNum = sheet.getLastRowNum();
             if (lastRowNum > HEADER_ROW_INDEX) {
                 Row lastRow = sheet.getRow(lastRowNum);
                 Cell endTimeCell = lastRow.getCell(3);
                 if (endTimeCell == null || endTimeCell.getStringCellValue().isEmpty()) {
                     closeActivity(workbook, lastRow);
+                    updateCharts(workbook, sheet);
                     saveWorkbook(workbook, file);
                     System.out.println("Stopped current activity.");
-                } else {
-                    System.out.println("No running activity to stop.");
                 }
             }
         } catch (IOException e) {
@@ -98,16 +90,65 @@ public class ExcelService {
     private void closeActivity(Workbook workbook, Row row) {
         LocalDateTime now = LocalDateTime.now();
         String startTimeStr = row.getCell(0).getStringCellValue();
-        
         LocalDateTime startTime = LocalDateTime.parse(
             LocalDateTime.now().format(DATE_FMT) + "T" + startTimeStr,
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss")
         );
-
         long durationMinutes = Duration.between(startTime, now).toMinutes();
-        
         row.getCell(3).setCellValue(now.format(TIME_FMT));
         row.getCell(4).setCellValue(durationMinutes);
+    }
+
+    private void updateCharts(XSSFWorkbook workbook, XSSFSheet logSheet) {
+        String analyticsSheetName = "Analytics";
+        XSSFSheet analyticsSheet = workbook.getSheet(analyticsSheetName);
+        if (analyticsSheet != null) {
+            workbook.removeSheetAt(workbook.getSheetIndex(analyticsSheet));
+        }
+        analyticsSheet = workbook.createSheet(analyticsSheetName);
+
+        // Calculate Summary
+        Map<String, Long> summary = new HashMap<>();
+        for (Row row : logSheet) {
+            if (row.getRowNum() <= HEADER_ROW_INDEX) continue;
+            Cell catCell = row.getCell(1);
+            Cell durCell = row.getCell(4);
+            if (catCell != null && durCell != null && durCell.getCellType() == CellType.NUMERIC) {
+                summary.merge(catCell.getStringCellValue(), (long) durCell.getNumericCellValue(), Long::sum);
+            }
+        }
+
+        // Write Summary Data for Chart
+        int rowIdx = 0;
+        Row header = analyticsSheet.createRow(rowIdx++);
+        header.createCell(0).setCellValue("Category");
+        header.createCell(1).setCellValue("Minutes");
+
+        for (Map.Entry<String, Long> entry : summary.entrySet()) {
+            Row row = analyticsSheet.createRow(rowIdx++);
+            row.createCell(0).setCellValue(entry.getKey());
+            row.createCell(1).setCellValue(entry.getValue());
+        }
+
+        // Create Pie Chart
+        XSSFDrawing drawing = analyticsSheet.createDrawingPatriarch();
+        XSSFClientAnchor anchor = drawing.createAnchor(0, 0, 0, 0, 3, 1, 10, 15);
+        XSSFChart chart = drawing.createChart(anchor);
+        chart.setTitleText("Time Distribution by Category");
+        chart.setTitleOverlay(false);
+
+        XDDFChartLegend legend = chart.getOrAddLegend();
+        legend.setPosition(LegendPosition.BOTTOM);
+
+        XDDFDataSource<String> categories = XDDFDataSourcesFactory.fromStringCellRange(analyticsSheet, 
+                new CellRangeAddress(1, rowIdx - 1, 0, 0));
+        XDDFNumericalDataSource<Double> values = XDDFDataSourcesFactory.fromNumericCellRange(analyticsSheet, 
+                new CellRangeAddress(1, rowIdx - 1, 1, 1));
+
+        XDDFPieChartData data = (XDDFPieChartData) chart.createData(ChartTypes.PIE, null, null);
+        data.setVaryColors(true);
+        data.addSeries(categories, values);
+        chart.plot(data);
     }
 
     private void createStyledCell(Row row, int column, String value, CellStyle style) {
@@ -130,57 +171,38 @@ public class ExcelService {
     }
 
     private Sheet getOrCreateSheet(Workbook workbook) {
-        if (workbook.getNumberOfSheets() > 0) {
-            return workbook.getSheetAt(0);
-        } else {
-            Sheet sheet = workbook.createSheet("Daily Log");
-            
-            // 1. Report Title
-            Row titleRow = sheet.createRow(0);
-            Cell titleCell = titleRow.createCell(0);
-            titleCell.setCellValue("DAILY PRODUCTIVITY REPORT");
-            CellStyle titleStyle = workbook.createCellStyle();
-            Font titleFont = workbook.createFont();
-            titleFont.setFontHeightInPoints((short) 18);
-            titleFont.setBold(true);
-            titleFont.setColor(IndexedColors.CORNFLOWER_BLUE.getIndex());
-            titleStyle.setFont(titleFont);
-            titleCell.setCellStyle(titleStyle);
-            sheet.addMergedRegion(new CellRangeAddress(0, 0, 0, 4));
+        if (workbook.getNumberOfSheets() > 0) return workbook.getSheetAt(0);
+        Sheet sheet = workbook.createSheet("Daily Log");
+        
+        Row titleRow = sheet.createRow(0);
+        Cell titleCell = titleRow.createCell(0);
+        titleCell.setCellValue("DAILY PRODUCTIVITY REPORT");
+        CellStyle titleStyle = workbook.createCellStyle();
+        Font titleFont = workbook.createFont();
+        titleFont.setFontHeightInPoints((short) 18);
+        titleFont.setBold(true);
+        titleFont.setColor(IndexedColors.CORNFLOWER_BLUE.getIndex());
+        titleStyle.setFont(titleFont);
+        titleCell.setCellStyle(titleStyle);
+        sheet.addMergedRegion(new CellRangeAddress(0, 0, 0, 4));
 
-            // 2. Date Subtitle
-            Row dateRow = sheet.createRow(1);
-            Cell dateCell = dateRow.createCell(0);
-            dateCell.setCellValue("Report Date: " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("MMMM dd, yyyy")));
-            CellStyle dateStyle = workbook.createCellStyle();
-            Font dateFont = workbook.createFont();
-            dateFont.setItalic(true);
-            dateStyle.setFont(dateFont);
-            dateCell.setCellStyle(dateStyle);
-            sheet.addMergedRegion(new CellRangeAddress(1, 1, 0, 4));
+        Row headerRow = sheet.createRow(HEADER_ROW_INDEX);
+        CellStyle headerStyle = workbook.createCellStyle();
+        headerStyle.setFillForegroundColor(IndexedColors.CORNFLOWER_BLUE.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+        Font hFont = workbook.createFont();
+        hFont.setColor(IndexedColors.WHITE.getIndex());
+        hFont.setBold(true);
+        headerStyle.setFont(hFont);
 
-            // 3. Main Table Headers
-            Row headerRow = sheet.createRow(HEADER_ROW_INDEX);
-            CellStyle headerStyle = workbook.createCellStyle();
-            headerStyle.setFillForegroundColor(IndexedColors.CORNFLOWER_BLUE.getIndex());
-            headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-            headerStyle.setBorderBottom(BorderStyle.MEDIUM);
-            headerStyle.setAlignment(HorizontalAlignment.CENTER);
-            
-            Font headerFont = workbook.createFont();
-            headerFont.setColor(IndexedColors.WHITE.getIndex());
-            headerFont.setBold(true);
-            headerStyle.setFont(headerFont);
-
-            for (int i = 0; i < HEADERS.length; i++) {
-                Cell cell = headerRow.createCell(i);
-                cell.setCellValue(HEADERS[i]);
-                cell.setCellStyle(headerStyle);
-            }
-
-            sheet.createFreezePane(0, 4); // Freeze Title and Headers
-            return sheet;
+        for (int i = 0; i < HEADERS.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(HEADERS[i]);
+            cell.setCellStyle(headerStyle);
         }
+        sheet.createFreezePane(0, 4);
+        return sheet;
     }
 
     private Workbook getWorkbook(File file) throws IOException {
@@ -196,10 +218,7 @@ public class ExcelService {
     public void printSummary() {
         Path path = getFilePath();
         File file = path.toFile();
-        if (!file.exists()) {
-            System.out.println("No logs for today.");
-            return;
-        }
+        if (!file.exists()) { System.out.println("No logs for today."); return; }
 
         Map<String, Long> categoryDuration = new HashMap<>();
         try (Workbook workbook = new XSSFWorkbook(new FileInputStream(file))) {
